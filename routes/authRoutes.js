@@ -4,6 +4,7 @@ const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
+const nodemailer = require('nodemailer');
 
 const router = express.Router();
 
@@ -13,57 +14,110 @@ const authLimiter = rateLimit({
     message: 'Too many accounts created from this IP, please try again after 15 minutes'
 });
 
-// Register User
-router.post('/register', authLimiter, [
+async function sendOtpEmail(userEmail, otp) {
+    const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+            user: process.env.EMAIL_USER,
+            pass: process.env.EMAIL_PASSWORD
+        }
+    });
+
+    const mailOptions = {
+        from: process.env.EMAIL_USER,
+        to: userEmail,
+        subject: 'Your OTP',
+        text: `Your OTP is: ${otp}`
+    };
+
+    try {
+        await transporter.sendMail(mailOptions);
+    } catch (error) {
+        console.error("Error sending email: ", error);
+        throw new Error('Failed to send OTP email');
+    }
+}
+
+router.post('/register', [
+    body('name').not().isEmpty().trim().escape(),
     body('username').not().isEmpty().trim().escape(),
     body('email').isEmail().normalizeEmail(),
+    body('mobileNumber').not().isEmpty().trim().escape(), // Add validation as per your requirement
     body('password').isLength({ min: 6 })
 ], async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-    }
-    const { username, email, password } = req.body;
+    const { name, username, email, mobileNumber, password } = req.body;
     try {
-        const existingUser = await User.findOne({ email });
+        const existingUser = await User.findOne({ $or: [{ email }, { username }, { mobileNumber }] });
         if (existingUser) {
-            return res.status(409).json({ message: "User already exists with that email." });
+            return res.status(409).json({ message: "An account already exists with provided email, username, or mobile number." });
         }
 
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
 
-        const newUser = new User({ username, email, password: hashedPassword });
+        const newUser = new User({ name, username, email, mobileNumber, password: hashedPassword });
         await newUser.save();
-        res.status(201).send('User registered');
+        res.status(201).send('User registered successfully');
     } catch (error) {
         res.status(500).json({ message: "Error registering new user", error: error });
     }
 });
 
 // Login User
-router.post('/login', authLimiter, [
-  body('email').isEmail().normalizeEmail(),
-  body('password').not().isEmpty()
+router.post('/login', [
+    body('email').isEmail().normalizeEmail(),
+    body('password').not().isEmpty()
 ], async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-  }
-  const { email, password } = req.body;
-  try {
-      const user = await User.findOne({ email });
-      if (!user) return res.status(404).json({ message: "User not found" });
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+    }
+    const { email, password } = req.body;
+    try {
+        const user = await User.findOne({ email });
+        if (!user) return res.status(404).json({ message: "User not found" });
 
-      const validPassword = await bcrypt.compare(password, user.password);
-      if (!validPassword) return res.status(401).json({ message: "Invalid password" });
+        const validPassword = await bcrypt.compare(password, user.password);
+        if (!validPassword) return res.status(401).json({ message: "Invalid password" });
 
-      const token = jwt.sign({ _id: user._id }, process.env.JWT_SECRET, { expiresIn: '1h' });
-      console.log('Generated Token:', token); // Log the token for debugging
-      res.header('auth-token', token).json({ token: token, message: 'Logged in' }); // Send token in body for easy access
-  } catch (error) {
-      res.status(500).json({ message: "Error logging in", error: error });
-  }
+        const otp = Math.floor(100000 + Math.random() * 900000); // Generate a 6-digit OTP
+        await sendOtpEmail(email, otp.toString()); // Send OTP to the user's email
+
+        user.otp = otp.toString();
+        user.otpExpiry = new Date(Date.now() + 300000); // OTP expires in 5 minutes
+        await user.save();
+
+        res.json({ message: 'OTP sent to your email, please verify to continue.' });
+    } catch (error) {
+        console.error("Login error: ", error);
+        res.status(500).json({ message: "Error on login", error });
+    }
+});
+
+// Verify OTP - Second step
+router.post('/verify-otp', [
+    body('email').isEmail().normalizeEmail(),
+    body('otp').not().isEmpty()
+], async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+    }
+    const { email, otp } = req.body;
+    try {
+        const user = await User.findOne({ email, otp, otpExpiry: { $gt: new Date() } });
+        if (!user) return res.status(400).json({ message: "Invalid OTP or OTP expired" });
+
+        // Clear OTP from the database
+        user.otp = null;
+        user.otpExpiry = null;
+        await user.save();
+
+        const token = jwt.sign({ _id: user._id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+        res.header('auth-token', token).json({ token, message: 'Logged in successfully' });
+    } catch (error) {
+        res.status(500).json({ message: "Error verifying OTP", error });
+    }
 });
 
 // Middleware to validate user tokens
@@ -99,5 +153,17 @@ router.put('/profile', verifyToken, [
         res.status(500).json({ message: "Error updating user profile", error });
     }
 });
+
+// Update user privacy settings
+router.patch('/update-privacy', verifyToken, async (req, res) => {
+    const { privacySetting } = req.body; // 'public' or 'private'
+    try {
+        const updatedUser = await User.findByIdAndUpdate(req.user._id, { privacySetting }, { new: true });
+        res.json({ message: 'Privacy settings updated successfully', updatedUser });
+    } catch (error) {
+        res.status(500).json({ message: "Error updating privacy settings", error });
+    }
+});
+
 
 module.exports = router;

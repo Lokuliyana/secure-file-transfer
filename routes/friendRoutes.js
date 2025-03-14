@@ -60,6 +60,28 @@ router.post('/reject-friend-request/:userId', verifyToken, async (req, res) => {
     }
 });
 
+// Search for users by name, username, or email
+router.get('/search', verifyToken, async (req, res) => {
+    const { search } = req.query;
+    if (!search) {
+        return res.status(400).send('Search query is required.');
+    }
+
+    try {
+        const users = await User.find({
+            $or: [
+                { name: { $regex: search, $options: 'i' } },
+                { username: { $regex: search, $options: 'i' } },
+                { email: { $regex: search, $options: 'i' } }
+            ]
+        }).select('-password -otp -otpExpiry'); // Exclude sensitive information
+
+        res.json(users);
+    } catch (error) {
+        res.status(500).json({ message: "Error fetching users", error });
+    }
+});
+
 // View the user's friends list
 router.get('/friends', verifyToken, async (req, res) => {
     try {
@@ -102,5 +124,7 @@ router.post('/add-close-friend/:userId', verifyToken, async (req, res) => {
         res.status(500).json({ message: "Error adding close friend", error });
     }
 });
+
+
 
 module.exports = router;
