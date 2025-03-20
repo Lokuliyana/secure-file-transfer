@@ -1,10 +1,10 @@
 const express = require('express');
-const cors = require('cors');
-require('dotenv').config();
 const mongoose = require('mongoose');
 const helmet = require('helmet');
+const cors = require('cors');
 const app = express();
 
+require('dotenv').config();
 require('./tasks/scheduler');
 
 app.use(cors({
@@ -13,26 +13,26 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-
 // Middleware
-app.use(express.json()); // Parses JSON bodies
-app.use(helmet()); // Adds security headers to responses
+app.use(express.json());
+app.use(helmet());
+app.use(cors());
 
-// Connect to MongoDB
+// Database Connection
 mongoose.connect(process.env.MONGO_URI)
     .then(() => console.log('MongoDB connected'))
     .catch(err => console.log(err));
 
-// Routes
+// Route Imports
 const authRoutes = require('./routes/authRoutes');
 const friendRoutes = require('./routes/friendRoutes');
-const fileRoutes = require('./routes/fileRoutes'); // Correctly declare a separate variable for file routes
+const fileRoutes = require('./routes/fileRoutes');
 
-// Route middleware
+// Routes
 app.use('/api/user', authRoutes);
 app.use('/api/friends', friendRoutes);
 app.use('/api/file', fileRoutes);
 
-// Server listening
+// Start Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

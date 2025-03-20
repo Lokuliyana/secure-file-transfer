@@ -105,26 +105,72 @@ router.delete('/remove-friend/:userId', verifyToken, async (req, res) => {
     }
 });
 
-// Add a close friend
+// Toggle close friend status (Add or Remove)
 router.post('/add-close-friend/:userId', verifyToken, async (req, res) => {
     try {
         const user = await User.findById(req.user._id);
         if (!user.friends.includes(req.params.userId)) {
             return res.status(400).send('User is not a friend.');
         }
-        if (user.closeFriends.includes(req.params.userId)) {
-            return res.status(400).send('Already a close friend.');
+
+        const userId = req.params.userId;
+        const isCloseFriend = user.closeFriends.includes(userId);
+
+        if (isCloseFriend) {
+            // Remove from close friends
+            user.closeFriends = user.closeFriends.filter(id => id.toString() !== userId);
+            await user.save();
+            return res.send({ message: 'Removed from close friends.', closeFriends: user.closeFriends });
+        } else {
+            // Add to close friends
+            user.closeFriends.push(userId);
+            await user.save();
+            return res.send({ message: 'Added to close friends.', closeFriends: user.closeFriends });
         }
-
-        user.closeFriends.push(req.params.userId);
-        await user.save();
-
-        res.send('Added to close friends.');
     } catch (error) {
-        res.status(500).json({ message: "Error adding close friend", error });
+        res.status(500).json({ message: "Error updating close friend status", error });
     }
 });
 
+// Get Friend's Profile
+router.get('/profile/:userId', verifyToken, async (req, res) => {
+    try {
+        const friend = await User.findById(req.params.userId).select('-password -otp -otpExpiry'); // Exclude sensitive data
+
+        if (!friend) {
+            return res.status(404).json({ message: "User not found" });
+        }
+
+        // Check if the requesting user is a friend
+        const isFriend = friend.friends.includes(req.user._id);
+        const isCloseFriend = friend.closeFriends.includes(req.user._id);
+        
+        // If the profile is private and the requester is not a friend, hide certain details
+        if (friend.isPrivate && !isFriend) {
+            return res.json({
+                username: friend.username,
+                email: friend.email,
+                avatar: friend.avatar || 'default-avatar.png',
+                isPrivate: true,
+                isFriend: false,
+                files: []  // No files should be visible
+            });
+        }
+
+        res.json({
+            username: friend.username,
+            email: friend.email,
+            avatar: friend.avatar || 'default-avatar.png',
+            isPrivate: friend.isPrivate || false,
+            isFriend: isFriend,
+            isCloseFriend: isCloseFriend,
+            files: friend.files || []
+        });
+
+    } catch (error) {
+        res.status(500).json({ message: "Error fetching profile", error });
+    }
+});
 
 
 module.exports = router;

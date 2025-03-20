@@ -4,8 +4,10 @@ const userSchema = new mongoose.Schema({
     name: { type: String, required: true },
     username: { type: String, required: true, unique: true },
     email: { type: String, required: true, unique: true },
-    mobileNumber: { type: String, required: true, unique: true }, // Assuming mobile numbers are unique per user
+    mobileNumber: { type: String, required: true, unique: true },
     password: { type: String, required: true },
+    profilePicture: { type: String, default: null },  // URL to the profile picture
+    publicKey: { type: String, required: true }, // Store the user's RSA public key
     createdAt: { type: Date, default: Date.now },
     friends: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
     friendRequests: [{

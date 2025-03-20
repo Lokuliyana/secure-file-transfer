@@ -1,12 +1,36 @@
+const fs = require('fs');
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
+const { generateKeyPairSync } = require('crypto');
 const nodemailer = require('nodemailer');
-
+const { check } = require('express-validator');
 const router = express.Router();
+
+// Middleware to validate user tokens
+const verifyToken = require('../middleware/verifyToken');
+
+// Multer and path imports
+const multer = require('multer');
+const path = require('path');
+
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        const dir = './uploads/profile-pictures/';
+        fs.mkdirSync(dir, { recursive: true }); // Ensure directory exists
+        cb(null, dir);
+    },
+    filename: (req, file, cb) => {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+    }
+});
+
+const upload = multer({ storage: storage });
+
 
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
@@ -14,120 +38,126 @@ const authLimiter = rateLimit({
     message: 'Too many accounts created from this IP, please try again after 15 minutes'
 });
 
-async function sendOtpEmail(userEmail, otp) {
-    const transporter = nodemailer.createTransport({
-        service: 'gmail',
-        auth: {
-            user: process.env.EMAIL_USER,
-            pass: process.env.EMAIL_PASSWORD
-        }
+// Function to generate RSA key pair
+function generateRSAKeys() {
+    const { publicKey, privateKey } = generateKeyPairSync('rsa', {
+        modulusLength: 2048,
+        publicKeyEncoding: { type: 'spki', format: 'pem' },
+        privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
     });
-
-    const mailOptions = {
-        from: process.env.EMAIL_USER,
-        to: userEmail,
-        subject: 'Your OTP',
-        text: `Your OTP is: ${otp}`
-    };
-
-    try {
-        await transporter.sendMail(mailOptions);
-    } catch (error) {
-        console.error("Error sending email: ", error);
-        throw new Error('Failed to send OTP email');
-    }
+    return { publicKey, privateKey };
 }
 
 router.post('/register', [
     body('name').not().isEmpty().trim().escape(),
     body('username').not().isEmpty().trim().escape(),
     body('email').isEmail().normalizeEmail(),
-    body('mobileNumber').not().isEmpty().trim().escape(), // Add validation as per your requirement
+    body('mobileNumber').not().isEmpty().trim().escape(),
     body('password').isLength({ min: 6 })
 ], async (req, res) => {
     const { name, username, email, mobileNumber, password } = req.body;
+
     try {
+        // Check if user already exists
         const existingUser = await User.findOne({ $or: [{ email }, { username }, { mobileNumber }] });
         if (existingUser) {
             return res.status(409).json({ message: "An account already exists with provided email, username, or mobile number." });
         }
 
+        // Hash password
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
 
-        const newUser = new User({ name, username, email, mobileNumber, password: hashedPassword });
+        // Generate RSA key pair
+        const { publicKey, privateKey } = generateRSAKeys();
+
+        // Create new user with public key stored
+        const newUser = new User({
+            name,
+            username,
+            email,
+            mobileNumber,
+            password: hashedPassword,
+            publicKey // Store public key in database
+        });
+
         await newUser.save();
-        res.status(201).send('User registered successfully');
+
+        // Respond with private key (user must save it securely)
+        res.status(201).json({
+            message: 'User registered successfully',
+            privateKey // Send private key once
+        });
+
     } catch (error) {
-        res.status(500).json({ message: "Error registering new user", error: error });
+        res.status(500).json({ message: "Error registering new user", error: error.toString() });
     }
 });
 
-// Login User
+module.exports = router;
 router.post('/login', [
-    body('email').isEmail().normalizeEmail(),
-    body('password').not().isEmpty()
+    check('emailOrUsername')
+        .trim()
+        .escape()
+        .notEmpty()
+        .withMessage('Email or username is required')
+        .custom(value => value.includes('@') ? check('emailOrUsername').isEmail().withMessage('Invalid email format') : true),
+    check('password').notEmpty().withMessage('Password is required')
 ], async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
         return res.status(400).json({ errors: errors.array() });
     }
-    const { email, password } = req.body;
+    const { emailOrUsername, password } = req.body;
+
     try {
-        const user = await User.findOne({ email });
-        if (!user) return res.status(404).json({ message: "User not found" });
+        // Find user by email OR username
+        const user = await User.findOne({ 
+            $or: [{ email: emailOrUsername }, { username: emailOrUsername }]
+        });
+
+        if (!user) {
+            return res.status(404).json({ message: "User not found" });
+        }
 
         const validPassword = await bcrypt.compare(password, user.password);
-        if (!validPassword) return res.status(401).json({ message: "Invalid password" });
+        if (!validPassword) {
+            return res.status(401).json({ message: "Invalid password" });
+        }
 
-        const otp = Math.floor(100000 + Math.random() * 900000); // Generate a 6-digit OTP
-        await sendOtpEmail(email, otp.toString()); // Send OTP to the user's email
+        const token = jwt.sign({ _id: user._id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+        res.header('auth-token', token).json({ 
+            token: token, 
+            message: 'Logged in successfully' 
+        });
 
-        user.otp = otp.toString();
-        user.otpExpiry = new Date(Date.now() + 300000); // OTP expires in 5 minutes
-        await user.save();
-
-        res.json({ message: 'OTP sent to your email, please verify to continue.' });
     } catch (error) {
         console.error("Login error: ", error);
         res.status(500).json({ message: "Error on login", error });
     }
 });
 
-// Verify OTP - Second step
-router.post('/verify-otp', [
-    body('email').isEmail().normalizeEmail(),
-    body('otp').not().isEmpty()
-], async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
+router.post('/upload-profile-picture', verifyToken, upload.single('profilePicture'), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ message: "No file uploaded." });
     }
-    const { email, otp } = req.body;
+    
     try {
-        const user = await User.findOne({ email, otp, otpExpiry: { $gt: new Date() } });
-        if (!user) return res.status(400).json({ message: "Invalid OTP or OTP expired" });
+        const user = await User.findByIdAndUpdate(req.user._id, {
+            profilePicture: req.file.path
+        }, { new: true });
 
-        // Clear OTP from the database
-        user.otp = null;
-        user.otpExpiry = null;
-        await user.save();
-
-        const token = jwt.sign({ _id: user._id }, process.env.JWT_SECRET, { expiresIn: '1h' });
-        res.header('auth-token', token).json({ token, message: 'Logged in successfully' });
+        res.json({ message: 'Profile picture updated successfully', profilePicture: req.file.path });
     } catch (error) {
-        res.status(500).json({ message: "Error verifying OTP", error });
+        res.status(500).json({ message: "Error updating profile picture", error: error.toString() });
     }
 });
-
-// Middleware to validate user tokens
-const verifyToken = require('../middleware/verifyToken');
 
 router.get('/profile', verifyToken, async (req, res) => {
     try {
         const user = await User.findById(req.user._id).select('-password'); // Exclude password from result
         if (!user) return res.status(404).send('User not found');
-        res.json(user);
+        res.json({ user, profilePicture: user.profilePicture });
     } catch (error) {
         res.status(500).json({ message: "Error fetching user profile", error });
     }
@@ -135,7 +165,9 @@ router.get('/profile', verifyToken, async (req, res) => {
 
 router.put('/profile', verifyToken, [
     body('email').optional().isEmail().normalizeEmail(),
-    body('username').optional().not().isEmpty().trim().escape()
+    body('username').optional().not().isEmpty().trim().escape(),
+    body('name').optional().not().isEmpty().trim().escape(), // Validate name
+    body('mobileNumber').optional().matches(/^[0-9]+$/).withMessage('Invalid mobile number'), // Validate mobile number as digits
 ], async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -148,11 +180,12 @@ router.put('/profile', verifyToken, [
             updateData.password = await bcrypt.hash(updateData.password, salt);
         }
         const user = await User.findByIdAndUpdate(req.user._id, { $set: updateData }, { new: true }).select('-password');
-        res.json(user);
+        res.json({ message: "Profile updated successfully", user });
     } catch (error) {
         res.status(500).json({ message: "Error updating user profile", error });
     }
 });
+
 
 // Update user privacy settings
 router.patch('/update-privacy', verifyToken, async (req, res) => {
