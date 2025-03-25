@@ -3,13 +3,14 @@ const mongoose = require('mongoose');
 const helmet = require('helmet');
 const cors = require('cors');
 const app = express();
+const path = require('path');
 
 require('dotenv').config();
 require('./tasks/scheduler');
 
 app.use(cors({
     origin: '*', // Be more specific in production
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
@@ -22,6 +23,14 @@ app.use(cors());
 mongoose.connect(process.env.MONGO_URI)
     .then(() => console.log('MongoDB connected'))
     .catch(err => console.log(err));
+
+// Serve uploaded profile pictures statically
+app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
+  setHeaders: (res, filePath) => {
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin'); // ✅ Fix CORP error
+  }
+}));
+
 
 // Route Imports
 const authRoutes = require('./routes/authRoutes');

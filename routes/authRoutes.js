@@ -1,44 +1,53 @@
-const fs = require('fs');
+require('dotenv').config();
 const express = require('express');
+const nodemailer = require('nodemailer');
+const { check, validationResult, body } = require('express-validator');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
-const rateLimit = require('express-rate-limit');
-const { body, validationResult } = require('express-validator');
-const { generateKeyPairSync } = require('crypto');
-const nodemailer = require('nodemailer');
-const { check } = require('express-validator');
-const router = express.Router();
-
-// Middleware to validate user tokens
-const verifyToken = require('../middleware/verifyToken');
-
-// Multer and path imports
 const multer = require('multer');
 const path = require('path');
+const fs = require('fs');
+const rateLimit = require('express-rate-limit');
+const { generateKeyPairSync } = require('crypto');
+const User = require('../models/User');
+const router = express.Router();
+const Notification = require('../models/Notifications'); // Assuming this is the correct path
 
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        const dir = './uploads/profile-pictures/';
-        fs.mkdirSync(dir, { recursive: true }); // Ensure directory exists
-        cb(null, dir);
-    },
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+const otpStorage = {}; // Temporary in-memory storage for OTPs
+const verifyToken = require('../middleware/verifyToken'); // Adjust path as needed
+
+
+// Configure Nodemailer Transporter
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
     }
 });
 
-const upload = multer({ storage: storage });
+// Function to generate OTP
+function generateOTP() {
+    return Math.floor(100000 + Math.random() * 900000); // 6-digit OTP
+}
 
+// Function to send OTP via email
+async function sendOTP(email, otp, message) {
+    const mailOptions = {
+        from: process.env.EMAIL_USER,
+        to: email,
+        subject: "Your One-Time Password (OTP) for Authentication",
+        text: `${message}\n\nYour OTP is: ${otp}\nThis OTP is valid for 5 minutes.`
+    };
 
-const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // Limit each IP to 10 login/register requests per windowMs
-    message: 'Too many accounts created from this IP, please try again after 15 minutes'
-});
+    try {
+        await transporter.sendMail(mailOptions);
+    } catch (error) {
+        console.error("Error sending OTP email:", error);
+    }
+}
 
-// Function to generate RSA key pair
+// RSA Key Generation
 function generateRSAKeys() {
     const { publicKey, privateKey } = generateKeyPairSync('rsa', {
         modulusLength: 2048,
@@ -48,6 +57,54 @@ function generateRSAKeys() {
     return { publicKey, privateKey };
 }
 
+// ✅ Storage Configuration
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+      const dir = './uploads/profile-pictures/';
+      fs.mkdirSync(dir, { recursive: true });
+      cb(null, dir);
+    },
+    filename: async (req, file, cb) => {
+      const userId = req.user._id;
+      const ext = path.extname(file.originalname);
+      const filePath = path.join(__dirname, `../uploads/profile-pictures/${userId}${ext}`);
+  
+      // ✅ Delete old image if exists
+      fs.readdir(path.join(__dirname, '../uploads/profile-pictures'), (err, files) => {
+        if (!err) {
+          files.forEach(filename => {
+            if (filename.startsWith(userId)) {
+              fs.unlinkSync(path.join(__dirname, `../uploads/profile-pictures/${filename}`));
+            }
+          });
+        }
+        cb(null, `${userId}${ext}`);
+      });
+    }
+  });
+
+  // ✅ Image File Filter
+const fileFilter = (req, file, cb) => {
+    const allowedTypes = /jpeg|jpg|png|gif/;
+    const ext = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mime = allowedTypes.test(file.mimetype);
+    if (ext && mime) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed (jpeg, jpg, png, gif)'));
+    }
+  };
+  
+  const upload = multer({ storage, fileFilter });
+
+// Rate Limiting
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    message: 'Too many accounts created from this IP, please try again after 15 minutes'
+});
+
+// **REGISTER USER (Without Saving to Database)**
 router.post('/register', [
     body('name').not().isEmpty().trim().escape(),
     body('username').not().isEmpty().trim().escape(),
@@ -58,61 +115,60 @@ router.post('/register', [
     const { name, username, email, mobileNumber, password } = req.body;
 
     try {
-        // Check if user already exists
         const existingUser = await User.findOne({ $or: [{ email }, { username }, { mobileNumber }] });
         if (existingUser) {
-            return res.status(409).json({ message: "An account already exists with provided email, username, or mobile number." });
+            return res.status(409).json({ message: "An account already exists with the provided email, username, or mobile number." });
         }
 
-        // Hash password
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(password, salt);
-
-        // Generate RSA key pair
+        // Hash password but don't save to DB yet
+        const hashedPassword = await bcrypt.hash(password, 10);
         const { publicKey, privateKey } = generateRSAKeys();
 
-        // Create new user with public key stored
-        const newUser = new User({
-            name,
-            username,
-            email,
-            mobileNumber,
-            password: hashedPassword,
-            publicKey // Store public key in database
-        });
+        // Store user details temporarily in `otpStorage`
+        const otp = generateOTP();
+        otpStorage[email] = { otp, userData: { name, username, email, mobileNumber, password: hashedPassword, publicKey } };
 
-        await newUser.save();
+        // Send OTP Email
+        await sendOTP(email, otp, "Welcome to our platform! Please verify your email by entering the OTP below.");
 
-        // Respond with private key (user must save it securely)
         res.status(201).json({
-            message: 'User registered successfully',
-            privateKey // Send private key once
+            message: 'OTP sent to your email. Please verify to complete registration.'
         });
 
     } catch (error) {
-        res.status(500).json({ message: "Error registering new user", error: error.toString() });
+        res.status(500).json({ message: "Error registering user", error: error.toString() });
     }
 });
 
-module.exports = router;
-router.post('/login', [
-    check('emailOrUsername')
-        .trim()
-        .escape()
-        .notEmpty()
-        .withMessage('Email or username is required')
-        .custom(value => value.includes('@') ? check('emailOrUsername').isEmail().withMessage('Invalid email format') : true),
-    check('password').notEmpty().withMessage('Password is required')
-], async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
+// **VERIFY OTP & SAVE USER TO DATABASE**
+router.post('/verify-registration-otp', async (req, res) => {
+    const { email, otp } = req.body;
+
+    if (!otpStorage[email] || otpStorage[email].otp != otp) {
+        return res.status(400).json({ message: "Invalid or expired OTP!" });
     }
+
+    // Retrieve stored user data
+    const { userData } = otpStorage[email];
+
+    try {
+        // Save user to database
+        const newUser = new User(userData);
+        await newUser.save();
+
+        delete otpStorage[email]; // Remove from storage after successful registration
+
+        res.json({ message: "Email verified and account created successfully. You can now log in." });
+    } catch (error) {
+        res.status(500).json({ message: "Error saving user data", error: error.toString() });
+    }
+});
+
+router.post('/login', async (req, res) => {
     const { emailOrUsername, password } = req.body;
 
     try {
-        // Find user by email OR username
-        const user = await User.findOne({ 
+        const user = await User.findOne({
             $or: [{ email: emailOrUsername }, { username: emailOrUsername }]
         });
 
@@ -125,10 +181,16 @@ router.post('/login', [
             return res.status(401).json({ message: "Invalid password" });
         }
 
-        const token = jwt.sign({ _id: user._id }, process.env.JWT_SECRET, { expiresIn: '1h' });
-        res.header('auth-token', token).json({ 
-            token: token, 
-            message: 'Logged in successfully' 
+        // Generate OTP and store it temporarily
+        const otp = generateOTP();
+        otpStorage[user.email] = otp;
+
+        // Send OTP Email
+        await sendOTP(user.email, otp, "A login attempt was detected. Enter the OTP below to proceed.");
+
+        res.json({ 
+            message: "OTP sent to your registered email. Enter the OTP to proceed.",
+            email: user.email  // ✅ Send email to frontend
         });
 
     } catch (error) {
@@ -137,29 +199,71 @@ router.post('/login', [
     }
 });
 
-router.post('/upload-profile-picture', verifyToken, upload.single('profilePicture'), async (req, res) => {
-    if (!req.file) {
-        return res.status(400).json({ message: "No file uploaded." });
-    }
-    
-    try {
-        const user = await User.findByIdAndUpdate(req.user._id, {
-            profilePicture: req.file.path
-        }, { new: true });
 
-        res.json({ message: 'Profile picture updated successfully', profilePicture: req.file.path });
+router.post('/verify-login-otp', async (req, res) => {
+    const { email, otp } = req.body;
+
+    // Ensure email exists and has a stored OTP
+    if (!otpStorage[email]) {
+        return res.status(400).json({ message: "OTP request not found for this email. Please request a new OTP." });
+    }
+
+    // Validate OTP
+    if (otpStorage[email] != otp) {
+        return res.status(400).json({ message: "Invalid or expired OTP!" });
+    }
+
+    const user = await User.findOne({ email });
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const token = jwt.sign({ _id: user._id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+    if (!user.privacySetting) {
+        user.privacySetting = 'public';
+        await user.save(); // Save default
+      }      
+
+    delete otpStorage[email]; // Remove OTP after successful login
+    res.header('auth-token', token).json({ 
+        token: token, 
+        message: 'Logged in successfully' 
+    });
+});
+
+// Update public key
+router.patch('/update-public-key', verifyToken, async (req, res) => {
+    const { publicKey } = req.body;
+    if (!publicKey) return res.status(400).json({ message: "Public key is required" });
+
+    try {
+        const updated = await User.findByIdAndUpdate(req.user._id, { publicKey }, { new: true });
+        res.json({ message: "Public key updated successfully", updatedUser: updated });
     } catch (error) {
-        res.status(500).json({ message: "Error updating profile picture", error: error.toString() });
+        console.error("Public key update error:", error);
+        res.status(500).json({ message: "Error updating public key", error });
     }
 });
 
 router.get('/profile', verifyToken, async (req, res) => {
     try {
-        const user = await User.findById(req.user._id).select('-password'); // Exclude password from result
-        if (!user) return res.status(404).send('User not found');
-        res.json({ user, profilePicture: user.profilePicture });
+      const user = await User.findById(req.user._id).select('-password');
+      if (!user) return res.status(404).send('User not found');
+  
+      // Check if profile picture exists in known extensions
+      const extensions = ['.jpg', '.jpeg', '.png', '.gif'];
+      const basePath = path.join(__dirname, '../uploads/profile-pictures');
+      let profilePictureUrl = null;
+  
+      for (let ext of extensions) {
+        const filePath = path.join(basePath, `${user._id}${ext}`);
+        if (fs.existsSync(filePath)) {
+          profilePictureUrl = `http://localhost:3000/uploads/profile-pictures/${user._id}${ext}`;
+          break;
+        }
+      }
+  
+      res.json({ user, profilePicture: profilePictureUrl });
     } catch (error) {
-        res.status(500).json({ message: "Error fetching user profile", error });
+      res.status(500).json({ message: "Error fetching user profile", error });
     }
 });
 
@@ -186,15 +290,84 @@ router.put('/profile', verifyToken, [
     }
 });
 
+// ✅ Upload Profile Picture Route
+router.post('/upload-profile-picture', verifyToken, upload.single('profilePicture'), async (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ message: "No image uploaded." });
+    }
+  
+    const filename = req.file.filename;
+    const fileUrl = `/uploads/profile-pictures/${filename}`;
+  
+    try {
+      await User.findByIdAndUpdate(req.user._id, { profilePicture: fileUrl }, { new: true });
+      res.json({ message: "✅ Profile picture updated successfully", profilePicture: `http://localhost:3000${fileUrl}` });
+    } catch (error) {
+      console.error("❌ Error saving profile picture:", error);
+      res.status(500).json({ message: "Error saving profile picture", error });
+    }
+  });
 
+  
 // Update user privacy settings
 router.patch('/update-privacy', verifyToken, async (req, res) => {
     const { privacySetting } = req.body; // 'public' or 'private'
     try {
         const updatedUser = await User.findByIdAndUpdate(req.user._id, { privacySetting }, { new: true });
         res.json({ message: 'Privacy settings updated successfully', updatedUser });
+        const newNotification = new Notification({
+            userId: req.user._id,
+            type: 'Privacy Settings Change',
+            title: 'Privacy Settings Updated',
+            message: `Your privacy settings have been updated to ${privacySetting}.`,
+        });
+        await newNotification.save();
+        
+        res.json({ message: 'Privacy settings updated successfully', updatedUser });
     } catch (error) {
         res.status(500).json({ message: "Error updating privacy settings", error });
+    }
+});
+
+// Search Users by name, username, or email
+router.get('/search', verifyToken, async (req, res) => {
+    const { search } = req.query;
+    if (!search) {
+        return res.status(400).send('Search query is required.');
+    }
+
+    try {
+        const users = await User.find({
+            $or: [
+                { name: { $regex: search, $options: 'i' } },
+                { username: { $regex: search, $options: 'i' } },
+                { email: { $regex: search, $options: 'i' } }
+            ]
+        }).select('-password -otp -otpExpiry'); // Exclude sensitive information
+
+        res.json(users);
+    } catch (error) {
+        res.status(500).json({ message: "Error fetching users", error });
+    }
+});
+
+router.get('/notifications', verifyToken, async (req, res) => {
+    console.log("Fetching notifications for user:", req.user._id);
+    try {
+        const userId = req.user._id;
+        const notifications = await Notification.find({ userId: userId })
+            .sort({ timestamp: -1 })
+            .limit(25);
+
+        if (!notifications.length) {
+            console.log("No notifications found for user:", userId);
+            return res.status(404).json({ message: "No notifications found." });
+        }
+
+        res.json(notifications);
+    } catch (error) {
+        console.error("Error fetching notifications:", error);
+        res.status(500).json({ message: "Failed to fetch notifications", error: error.toString() });
     }
 });
 

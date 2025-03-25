@@ -1,28 +1,41 @@
 const express = require('express');
 const User = require('../models/User');
 const verifyToken = require('../middleware/verifyToken');
+const Notification = require('../models/Notifications'); // Assuming this is the correct path
 
 const router = express.Router();
+const mongoose = require("mongoose");
 
-// Send a friend request
 router.post('/friend-request/:userId', verifyToken, async (req, res) => {
     try {
-        const recipient = await User.findById(req.params.userId);
-        if (!recipient) return res.status(404).send('User not found.');
-
-        if (recipient.friendRequests.some(request => request.userId.equals(req.user._id))) {
-            return res.status(400).send('Friend request already sent.');
-        }
-
-        recipient.friendRequests.push({ userId: req.user._id });
-        await recipient.save();
-
-        res.send('Friend request sent.');
+      const recipient = await User.findById(req.params.userId);
+      if (!recipient) return res.status(404).send('User not found.');
+  
+      if (recipient.friendRequests.some(request => request.userId.equals(req.user._id))) {
+        return res.status(400).send('Friend request already sent.');
+      }
+  
+      recipient.friendRequests.push({ userId: req.user._id });
+      await recipient.save();
+      
+      console.log("🔐 Sender (req.user):", req.user);
+      const sender = await User.findById(req.user._id);
+      console.log("👤 Sender full object:", sender);
+  
+      const newNotification = new Notification({
+        userId: req.params.userId, // recipient
+        type: 'Friend Request',
+        title: 'New Friend Request',
+        message: `${sender.username} has sent you a friend request.`, // ✅
+      });
+  
+      await newNotification.save();
+      res.send('Friend request sent.');
     } catch (error) {
-        res.status(500).json({ message: "Error sending friend request", error });
+      res.status(500).json({ message: "Error sending friend request", error });
     }
 });
-
+  
 // Accept a friend request
 router.post('/accept-friend-request/:userId', verifyToken, async (req, res) => {
     try {
@@ -41,11 +54,20 @@ router.post('/accept-friend-request/:userId', verifyToken, async (req, res) => {
         requester.friends.push(req.user._id);
         await requester.save();
 
+        const newNotification = new Notification({
+            userId: requesterId, // Requester's ID
+            type: 'Accept Friend Request',
+            title: 'Friend Request Accepted',
+            message: `${currentUser.username} has accepted your friend request.`,
+        });
+        await newNotification.save();
+
         res.send('Friend request accepted.');
     } catch (error) {
         res.status(500).json({ message: "Error accepting friend request", error });
     }
 });
+
 
 // Reject a friend request
 router.post('/reject-friend-request/:userId', verifyToken, async (req, res) => {
@@ -92,18 +114,35 @@ router.get('/friends', verifyToken, async (req, res) => {
     }
 });
 
-// Remove a friend
+// Remove a friend (bi-directionally)
 router.delete('/remove-friend/:userId', verifyToken, async (req, res) => {
     try {
-        const user = await User.findById(req.user._id);
-        user.friends = user.friends.filter(friendId => !friendId.equals(req.params.userId));
-        await user.save();
+        const userIdToRemove = req.params.userId;
+        const currentUserId = req.user._id;
+
+        // Fetch both users
+        const currentUser = await User.findById(currentUserId);
+        const friend = await User.findById(userIdToRemove);
+
+        if (!currentUser || !friend) {
+            return res.status(404).json({ message: "User not found." });
+        }
+
+        // Remove each other from their friends array
+        currentUser.friends = currentUser.friends.filter(id => id.toString() !== userIdToRemove);
+        friend.friends = friend.friends.filter(id => id.toString() !== currentUserId);
+
+        // Save both users
+        await currentUser.save();
+        await friend.save();
 
         res.send('Friend removed.');
     } catch (error) {
+        console.error("❌ Backend Remove Friend Error:", error); // 🐛 Debug log
         res.status(500).json({ message: "Error removing friend", error });
     }
 });
+
 
 // Toggle close friend status (Add or Remove)
 router.post('/add-close-friend/:userId', verifyToken, async (req, res) => {
@@ -135,42 +174,57 @@ router.post('/add-close-friend/:userId', verifyToken, async (req, res) => {
 // Get Friend's Profile
 router.get('/profile/:userId', verifyToken, async (req, res) => {
     try {
-        const friend = await User.findById(req.params.userId).select('-password -otp -otpExpiry'); // Exclude sensitive data
-
-        if (!friend) {
-            return res.status(404).json({ message: "User not found" });
-        }
-
-        // Check if the requesting user is a friend
-        const isFriend = friend.friends.includes(req.user._id);
-        const isCloseFriend = friend.closeFriends.includes(req.user._id);
-        
-        // If the profile is private and the requester is not a friend, hide certain details
-        if (friend.isPrivate && !isFriend) {
-            return res.json({
-                username: friend.username,
-                email: friend.email,
-                avatar: friend.avatar || 'default-avatar.png',
-                isPrivate: true,
-                isFriend: false,
-                files: []  // No files should be visible
-            });
-        }
-
-        res.json({
-            username: friend.username,
-            email: friend.email,
-            avatar: friend.avatar || 'default-avatar.png',
-            isPrivate: friend.isPrivate || false,
-            isFriend: isFriend,
-            isCloseFriend: isCloseFriend,
-            files: friend.files || []
+      const friend = await User.findById(req.params.userId).select('-password -otp -otpExpiry');
+      if (!friend) {
+        return res.status(404).json({ message: "User not found" });
+      }
+  
+      const currentUserId = new mongoose.Types.ObjectId(req.user._id);
+  
+      const isFriend = friend.friends.includes(currentUserId);
+      const isCloseFriend = friend.closeFriends.includes(currentUserId);
+  
+      // ✅ Check if the current user has already sent a friend request to the target friend
+      const youRequested = friend.friendRequests.some(req => req.userId.equals(currentUserId));
+  
+      // ✅ Check if the target friend has already sent a request to the current user
+      const currentUser = await User.findById(currentUserId);
+      const hasRequestedYou = currentUser.friendRequests.some(req => req.userId.equals(friend._id));
+  
+      // 🔒 If private and not a friend
+      const isPrivate = friend.privacySetting === "private";
+      if (isPrivate && !isFriend) {
+        return res.json({
+          _id: friend._id,
+          username: friend.username,
+          email: friend.email,
+          avatar: friend.avatar || 'default-avatar.png',
+          isPrivate: true,
+          isFriend: false,
+          hasRequestedYou,
+          youRequested,
+          files: []
         });
-
+      }
+  
+      res.json({
+        _id: friend._id,
+        username: friend.username,
+        email: friend.email,
+        avatar: friend.avatar || 'default-avatar.png',
+        isPrivate: friend.isPrivate || false,
+        isFriend,
+        isCloseFriend,
+        hasRequestedYou,
+        youRequested,
+        files: friend.files || []
+      });
+  
     } catch (error) {
-        res.status(500).json({ message: "Error fetching profile", error });
+      console.error("🔥 Profile Fetch Error:", error);
+      res.status(500).json({ message: "Error fetching profile", error });
     }
-});
+  });
 
 
 module.exports = router;
