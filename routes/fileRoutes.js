@@ -49,20 +49,24 @@ function calculateFileHash(data) {
 }
 
 // Encrypt AES key with RSA public key
-function encryptKeyWithPublicKey(aesKey, publicKey) {
-    try {
-        return crypto.publicEncrypt(
-            {
-                key: publicKey,
-                padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-                oaepHash: "sha256",
-            },
-            aesKey
-        );
-    } catch (error) {
-        console.error("RSA Encryption Error:", error.message);
-        throw new Error('RSA Encryption Failed');
+function encryptKeyWithPublicKey(aesKeyBuffer, publicKey) {
+  try {
+    if (!Buffer.isBuffer(aesKeyBuffer)) {
+      throw new Error("AES key must be a Buffer");
     }
+
+    return crypto.publicEncrypt(
+      {
+        key: publicKey,
+        padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+        oaepHash: "sha256"
+      },
+      aesKeyBuffer
+    );
+  } catch (error) {
+    console.error("❌ RSA Encryption Error:", error.message);
+    throw new Error('RSA Encryption Failed');
+  }
 }
 
 function encryptChunk(chunk, aesKey, iv) {
@@ -118,11 +122,11 @@ router.post('/upload', verifyToken, upload.single('file'), async (req, res) => {
       const recipientIds = visibility === "friends" ? uploader.friends : uploader.closeFriends;
       const recipients = await User.find({ _id: { $in: recipientIds } }).select('publicKey');
 
-      recipients.forEach(recipient => {
+      for (const recipient of recipients) {
         if (recipient.publicKey) {
           encryptedKeysForRecipients[recipient._id] = encryptKeyWithPublicKey(aesKey, recipient.publicKey).toString('base64');
         }
-      });
+      }      
     }
 
     const newFile = new File({
@@ -180,6 +184,26 @@ router.post('/upload', verifyToken, upload.single('file'), async (req, res) => {
     decrypted = Buffer.concat([decrypted, decipher.final()]);
     return decrypted;
   };
+
+  router.post('/download/save-as', async (req, res) => {
+    try {
+      const { fileName, mimeType, bufferBase64 } = req.body;
+  
+      if (!fileName || !mimeType || !bufferBase64) {
+        return res.status(400).send("Missing required data.");
+      }
+  
+      const buffer = Buffer.from(bufferBase64, 'base64');
+  
+      res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+      res.setHeader("Content-Type", mimeType);
+      res.send(buffer);
+  
+    } catch (err) {
+      console.error("Save As Error:", err);
+      res.status(500).json({ message: "Failed to download", error: err.toString() });
+    }
+  });
     
   router.post('/download/:fileId', verifyToken, async (req, res) => {
     try {
@@ -187,49 +211,69 @@ router.post('/upload', verifyToken, upload.single('file'), async (req, res) => {
       if (!file) return res.status(404).send("File not found");
   
       const userId = req.user._id.toString();
+      const privateKey = req.body.privateKey;
+  
+      if (!privateKey) return res.status(400).send("Private key is required");
+  
+      // 🔐 Access check
       const hasAccess =
         file.visibility === 'public' ||
         file.owner._id.toString() === userId ||
         file.sharedWith.map(id => id.toString()).includes(userId) ||
-        file.encryptedKeysForRecipients[userId];
+        file.encryptedKeysForRecipients?.[userId];
   
       if (!hasAccess) return res.status(403).send("Access denied");
   
-      const privateKey = req.body.privateKey;
-      if (!privateKey) return res.status(400).send("Private key required");
-  
-      let aesKey;
-      if (file.visibility === "public") {
-        aesKey = Buffer.from(file.encryptedAesKey, 'base64');
-      } else {
-        const encryptedKey = file.owner._id.toString() === userId
+      // 🧩 Determine encrypted key
+      const encryptedKeyBase64 =
+        file.owner._id.toString() === userId
           ? file.encryptedAesKey
-          : file.encryptedKeysForRecipients[userId];
+          : file.encryptedKeysForRecipients?.[userId];
   
-        aesKey = crypto.privateDecrypt({
-          key: privateKey,
-          padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-          oaepHash: "sha256"
-        }, Buffer.from(encryptedKey, 'base64'));
+      if (!encryptedKeyBase64) {
+        console.error("🚫 Missing encrypted key for user:", userId);
+        return res.status(403).send("Encrypted AES key not available for you.");
       }
   
+      // 🔍 DEBUG LOG
+      console.log("🔐 Attempting decryption for user:", userId);
+      console.log("🔒 Encrypted AES key (base64):", encryptedKeyBase64.slice(0, 60) + "...");
+      console.log("🔑 Private key preview:", privateKey.slice(0, 60) + "...");
+  
+      // 🔓 Decrypt AES key using RSA private key
+      let aesKey;
+        try {
+          const encryptedBuffer = Buffer.from(encryptedKeyBase64, 'base64');
+          console.log("🔍 Encrypted buffer length:", encryptedBuffer.length);
+
+          aesKey = crypto.privateDecrypt(
+            {
+              key: privateKey,
+              padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+              oaepHash: "sha256"
+            },
+            encryptedBuffer
+          );
+
+          console.log("✅ AES key decrypted successfully. Length:", aesKey.length);
+        } catch (decryptionError) {
+          console.error("❌ RSA OAEP decryption failed:", decryptionError.message);
+          return res.status(500).send("RSA decryption failed. Please check your private key or try re-uploading the file.");
+        }
+
+      // 🔁 Decrypt chunks
       const iv = Buffer.from(file.iv, 'base64');
       const decryptedChunks = file.fileChunks.map(chunk => decryptChunk(chunk, aesKey, iv));
       const fullData = Buffer.concat(decryptedChunks);
   
+      // 🛡️ Verify file integrity
       const recalculatedHash = calculateFileHash(fullData);
       if (recalculatedHash !== file.fileHash) {
-        console.warn(`⚠️ File integrity compromised for ${file.name}`);
+        console.warn(`⚠️ File integrity check failed for ${file.name}`);
         return res.status(403).send("File integrity compromised.");
       }
   
-      const ext = path.extname(file.name).toLowerCase();
-      const mimeType = getMimeType(ext);
-  
-      res.setHeader("Content-Disposition", `attachment; filename="${file.name}"`);
-      res.setHeader("Content-Type", mimeType);
-      res.send(fullData);
-  
+      // 📥 Save download record
       await User.findByIdAndUpdate(req.user._id, {
         $addToSet: { downloadedFiles: file._id }
       });
@@ -241,12 +285,18 @@ router.post('/upload', verifyToken, upload.single('file'), async (req, res) => {
         message: `Your file ${file.name} was downloaded by ${req.user.username}.`,
       }).save();
   
+      // ✅ Send file as base64
+      res.json({
+        fileName: file.name,
+        mimeType: getMimeType(path.extname(file.name).toLowerCase()),
+        bufferBase64: fullData.toString('base64')
+      });
+  
     } catch (err) {
-      console.error("Download Error:", err);
+      console.error("🔥 Download error:", err);
       res.status(500).json({ message: "Download failed", error: err.toString() });
     }
-  });
-
+  });  
 
 // File integrity check before download or on system check
 router.get('/verify-file/:fileId', verifyToken, async (req, res) => {
@@ -297,7 +347,7 @@ router.get("/storage-usage", verifyToken, async (req, res) => {
       const downloadedSize = downloadedUser.downloadedFiles.reduce((sum, file) => sum + (file.size || 0), 0);
   
       const totalUsed = uploadedSize + downloadedSize;
-      const totalLimit = 5 * 1024 * 1024; // 50GB in bytes
+      const totalLimit = 5 * 1024 * 1024 * 1024; // ✅ 5 GB in bytes
 
       if (totalUsed > totalLimit * 0.9) { // If usage exceeds 90% of the limit
         const newNotification = new Notification({
@@ -440,14 +490,16 @@ router.post('/re-encrypt-for-friend/:friendId', verifyToken, async (req, res) =>
       let updatedCount = 0;
       for (const file of files) {
         if (!file.encryptedKeysForRecipients[friendId]) {
+          const encryptedKeyBuffer = Buffer.from(file.encryptedAesKey, 'base64'); // ✅ Safe conversion
           const aesKeyBuffer = crypto.privateDecrypt(
             {
               key: privateKey,
               padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
               oaepHash: "sha256",
             },
-            Buffer.from(file.encryptedAesKey, 'base64')
+            encryptedKeyBuffer
           );
+
   
           const encryptedKey = encryptKeyWithPublicKey(aesKeyBuffer, friend.publicKey);
           file.encryptedKeysForRecipients[friendId.toString()] = encryptedKey.toString('base64');

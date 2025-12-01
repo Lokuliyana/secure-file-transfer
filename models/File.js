@@ -7,7 +7,7 @@ const fileSchema = new mongoose.Schema({
     fileHash: { type: String, required: true }, // ✅ File hash for integrity checking
     encryptedAesKey: { type: String, required: true }, // Encrypted AES Key
     iv: { type: String, required: true }, // AES Initialization Vector
-    fileData: { type: String, required: true }, // Encrypted file content
+    fileData: { type: String}, // Encrypted file content
     // models/File.js
     fileChunks: [{ type: String }], // base64-encoded encrypted chunks
     size: { type: Number, required: true },  // in bytes

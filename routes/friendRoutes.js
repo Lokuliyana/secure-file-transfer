@@ -9,32 +9,69 @@ const mongoose = require("mongoose");
 router.post('/friend-request/:userId', verifyToken, async (req, res) => {
     try {
       const recipient = await User.findById(req.params.userId);
-      if (!recipient) return res.status(404).send('User not found.');
+      const sender = await User.findById(req.user._id);
+    
+      if (!recipient || !sender) return res.status(404).send("User not found.");
   
-      if (recipient.friendRequests.some(request => request.userId.equals(req.user._id))) {
-        return res.status(400).send('Friend request already sent.');
+      // Can't send request to self
+      if (recipient._id.equals(sender._id)) {
+        return res.status(400).send("Cannot send friend request to yourself.");
       }
   
-      recipient.friendRequests.push({ userId: req.user._id });
-      await recipient.save();
-      
-      console.log("🔐 Sender (req.user):", req.user);
-      const sender = await User.findById(req.user._id);
-      console.log("👤 Sender full object:", sender);
+      // Already friends
+      if (recipient.friends.includes(sender._id)) {
+        return res.status(400).send("Already friends.");
+      }
   
-      const newNotification = new Notification({
-        userId: req.params.userId, // recipient
-        type: 'Friend Request',
-        title: 'New Friend Request',
-        message: `${sender.username} has sent you a friend request.`, // ✅
-      });
+      // Already sent (check if sender already in recipient's requests)
+      const alreadyRequested = recipient.friendRequests.some(req =>
+        req.userId.equals(sender._id)
+      );
+      if (alreadyRequested) {
+        return res.status(400).send("Friend request already sent.");
+      }
   
-      await newNotification.save();
-      res.send('Friend request sent.');
+      // Check recipient's privacy setting
+      if (recipient.privacySetting === "public") {
+        // Auto accept friend request (mutual add)
+        recipient.friends.push(sender._id);
+        sender.friends.push(recipient._id);
+        await recipient.save();
+        await sender.save();
+  
+        const autoNotification = new Notification({
+          userId: recipient._id,
+          type: "Friend Request",
+          title: "New Friend Added",
+          message: `${sender.username} has added you as a friend.`,
+        });
+        await autoNotification.save();
+  
+        return res.send("Friend added automatically (public profile).");
+      } else {
+        // Private: store in recipient's friendRequests
+        recipient.friendRequests.push({
+          userId: sender._id,
+          createdAt: new Date(),
+        });
+        await recipient.save();
+  
+        const reqNotification = new Notification({
+          userId: recipient._id,
+          type: "Friend Request",
+          title: "New Friend Request",
+          message: `${sender.username} sent you a friend request.`,
+        });
+        await reqNotification.save();
+  
+        return res.send("Friend request sent (private profile).");
+      }
     } catch (error) {
-      res.status(500).json({ message: "Error sending friend request", error });
+      console.error("Friend request error:", error);
+      res.status(500).json({ message: "Error processing friend request", error });
     }
-});
+  });  
+
   
 // Accept a friend request
 router.post('/accept-friend-request/:userId', verifyToken, async (req, res) => {
@@ -69,19 +106,26 @@ router.post('/accept-friend-request/:userId', verifyToken, async (req, res) => {
 });
 
 
-// Reject a friend request
-router.post('/reject-friend-request/:userId', verifyToken, async (req, res) => {
+// Cancel a sent friend request
+router.post('/cancel-friend-request/:userId', verifyToken, async (req, res) => {
     try {
-        const user = await User.findById(req.user._id);
-        user.friendRequests = user.friendRequests.filter(request => !request.userId.equals(req.params.userId));
-        await user.save();
-
-        res.send('Friend request rejected.');
+      const recipient = await User.findById(req.params.userId);
+      if (!recipient) return res.status(404).send("Recipient not found.");
+  
+      // Remove sender's ID from recipient's friendRequests
+      recipient.friendRequests = recipient.friendRequests.filter(request =>
+        !request.userId.equals(req.user._id)
+      );
+  
+      await recipient.save();
+      res.send("Friend request cancelled.");
     } catch (error) {
-        res.status(500).json({ message: "Error rejecting friend request", error });
+      console.error("❌ Cancel request error:", error);
+      res.status(500).json({ message: "Error cancelling friend request", error });
     }
-});
-
+  });
+  
+  
 // Search for users by name, username, or email
 router.get('/search', verifyToken, async (req, res) => {
     const { search } = req.query;
@@ -104,15 +148,29 @@ router.get('/search', verifyToken, async (req, res) => {
     }
 });
 
-// View the user's friends list
 router.get('/friends', verifyToken, async (req, res) => {
     try {
-        const user = await User.findById(req.user._id).populate('friends', 'username email');
-        res.json(user.friends);
+        const user = await User.findById(req.user._id).populate('friends', 'username email profilePicture');
+        const response = user.friends.map(friend => {
+            const fullProfileUrl = friend.profilePicture?.startsWith('/uploads')
+              ? `http://localhost:3000${friend.profilePicture}`
+              : "default-profile.jpg";
+          
+            return {
+              _id: friend._id,
+              username: friend.username,
+              email: friend.email,
+              profilePicture: fullProfileUrl,
+              isCloseFriend: user.closeFriends.includes(friend._id.toString()),
+            };
+          });          
+      
+      res.json(response);
     } catch (error) {
-        res.status(500).json({ message: "Error fetching friends list", error });
+      console.error("Error fetching friends list:", error);
+      res.status(500).json({ message: "Error fetching friends list", error });
     }
-});
+});    
 
 // Remove a friend (bi-directionally)
 router.delete('/remove-friend/:userId', verifyToken, async (req, res) => {
@@ -171,6 +229,33 @@ router.post('/add-close-friend/:userId', verifyToken, async (req, res) => {
     }
 });
 
+// ✅ Save full updated close friend list
+router.post('/save-close-friends', verifyToken, async (req, res) => {
+    try {
+      const { closeFriends } = req.body; // [array of userIds]
+      const user = await User.findById(req.user._id);
+  
+      // Validate all are actual friends
+      const invalidIds = closeFriends.filter(id => !user.friends.includes(id));
+      if (invalidIds.length > 0) {
+        return res.status(400).json({ message: "Some users are not your friends." });
+      }
+  
+      // ✅ Update without triggering version conflict
+      const updated = await User.findByIdAndUpdate(
+        req.user._id,
+        { closeFriends },
+        { new: true, useFindAndModify: false }
+      );
+  
+      return res.json({ message: "✅ Close friends updated.", closeFriends: updated.closeFriends });
+  
+    } catch (err) {
+      console.error("Save close friends error:", err);
+      return res.status(500).json({ message: "Server error", error: err.toString() });
+    }
+});
+    
 // Get Friend's Profile
 router.get('/profile/:userId', verifyToken, async (req, res) => {
     try {
@@ -178,8 +263,11 @@ router.get('/profile/:userId', verifyToken, async (req, res) => {
       if (!friend) {
         return res.status(404).json({ message: "User not found" });
       }
-  
+      
+
       const currentUserId = new mongoose.Types.ObjectId(req.user._id);
+
+      const isSelf = friend._id.equals(currentUserId);
   
       const isFriend = friend.friends.includes(currentUserId);
       const isCloseFriend = friend.closeFriends.includes(currentUserId);
@@ -198,9 +286,10 @@ router.get('/profile/:userId', verifyToken, async (req, res) => {
           _id: friend._id,
           username: friend.username,
           email: friend.email,
-          avatar: friend.avatar || 'default-avatar.png',
+          profilePicture: friend.profilePicture || 'default-avatar.png',
           isPrivate: true,
           isFriend: false,
+          isSelf,
           hasRequestedYou,
           youRequested,
           files: []
@@ -211,7 +300,7 @@ router.get('/profile/:userId', verifyToken, async (req, res) => {
         _id: friend._id,
         username: friend.username,
         email: friend.email,
-        avatar: friend.avatar || 'default-avatar.png',
+        profilePicture: friend.profilePicture || 'default-avatar.png',
         isPrivate: friend.isPrivate || false,
         isFriend,
         isCloseFriend,

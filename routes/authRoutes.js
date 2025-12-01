@@ -150,15 +150,19 @@ router.post('/verify-registration-otp', async (req, res) => {
 
     // Retrieve stored user data
     const { userData } = otpStorage[email];
+    const privateKey = userData.privateKey;
 
     try {
-        // Save user to database
         const newUser = new User(userData);
         await newUser.save();
 
-        delete otpStorage[email]; // Remove from storage after successful registration
+        delete otpStorage[email]; // Clean up after use
 
-        res.json({ message: "Email verified and account created successfully. You can now log in." });
+        // ✅ Send private key back to frontend
+        res.json({
+            message: "Email verified and account created successfully.",
+            privateKey
+        });
     } catch (error) {
         res.status(500).json({ message: "Error saving user data", error: error.toString() });
     }
@@ -216,7 +220,7 @@ router.post('/verify-login-otp', async (req, res) => {
     const user = await User.findOne({ email });
     if (!user) return res.status(404).json({ message: "User not found" });
 
-    const token = jwt.sign({ _id: user._id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+    const token = jwt.sign({ _id: user._id, email: user.email}, process.env.JWT_SECRET, { expiresIn: '1h' });
     if (!user.privacySetting) {
         user.privacySetting = 'public';
         await user.save(); // Save default
@@ -308,13 +312,17 @@ router.post('/upload-profile-picture', verifyToken, upload.single('profilePictur
     }
   });
 
-  
-// Update user privacy settings
-router.patch('/update-privacy', verifyToken, async (req, res) => {
-    const { privacySetting } = req.body; // 'public' or 'private'
+  router.patch('/update-privacy', verifyToken, async (req, res) => {
+    const { privacySetting } = req.body;
+    console.log("🛡️ Incoming privacy setting:", privacySetting); // ✅ log this
+
+    if (!['public', 'private'].includes(privacySetting)) {
+        return res.status(400).json({ message: "Invalid privacy setting value." });
+    }
+
     try {
         const updatedUser = await User.findByIdAndUpdate(req.user._id, { privacySetting }, { new: true });
-        res.json({ message: 'Privacy settings updated successfully', updatedUser });
+
         const newNotification = new Notification({
             userId: req.user._id,
             type: 'Privacy Settings Change',
@@ -322,7 +330,7 @@ router.patch('/update-privacy', verifyToken, async (req, res) => {
             message: `Your privacy settings have been updated to ${privacySetting}.`,
         });
         await newNotification.save();
-        
+
         res.json({ message: 'Privacy settings updated successfully', updatedUser });
     } catch (error) {
         res.status(500).json({ message: "Error updating privacy settings", error });
